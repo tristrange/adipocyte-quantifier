@@ -24,23 +24,26 @@ Usage:
 
 import argparse
 from pathlib import Path
+from typing import Any, Dict, Optional, cast
+
+import matplotlib.patheffects as pe
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from typing import Any, cast
-from skimage import io, color, exposure, util, filters, feature, morphology, segmentation, measure, draw
-from skimage.morphology import disk, remove_small_holes, remove_small_objects
-from skimage.filters import frangi, meijering
-from skimage.feature import peak_local_max
+from numpy.typing import NDArray
 from scipy import ndimage as ndi
-import matplotlib.pyplot as plt
-import matplotlib.patheffects as pe
+from skimage import color, draw, exposure, feature, filters, io, measure, morphology, segmentation, util
+from skimage.feature import peak_local_max
+from skimage.filters import frangi, meijering
+from skimage.morphology import disk, remove_small_holes, remove_small_objects
 
 
 # ----------------------------
 # Core functions
 # ----------------------------
 
-def load_gray(path):
+def load_gray(path: str | Path) -> tuple[NDArray[np.float64], np.ndarray]:
+    """Load an image and return a normalized grayscale float array plus the original image."""
     img = io.imread(path)
     if img.ndim == 3:
         gray = color.rgb2gray(img)
@@ -55,15 +58,23 @@ def load_gray(path):
     if scale > 1e-6:
         eq = (eq - low) * (1.0 / scale)
         np.clip(eq, 0.0, 1.0, out=eq)
-    return eq, img
+    return np.asarray(eq, dtype=float), np.asarray(img)
 
 
 def detect_membranes(
-    gray,
-    use_tophat=True, tophat_radius=3, tophat_gain=0.6,
-    ridge_hi=0.85, ridge_lo_mul=0.45,
-    canny_sigma=1.6, canny_low=0.03, canny_high=0.12,
-    mem_close=3, mem_dilate=2):
+    gray: NDArray[np.float64],
+    use_tophat: bool = True,
+    tophat_radius: int = 3,
+    tophat_gain: float = 0.6,
+    ridge_hi: float = 0.85,
+    ridge_lo_mul: float = 0.45,
+    canny_sigma: float = 1.6,
+    canny_low: float = 0.03,
+    canny_high: float = 0.12,
+    mem_close: int = 3,
+    mem_dilate: int = 2,
+) -> tuple[NDArray[np.bool_], NDArray[np.float64], NDArray[np.float64]]:
+    """Detect membrane pixels and supporting intermediate layers for an input grayscale image."""
     inv = 1.0 - gray
 
     # top-hat preboost (optional) — now robust across skimage versions
@@ -88,9 +99,8 @@ def detect_membranes(
 
     # ridge enhancement (bright ridges on the inverted image)
     sigmas = np.linspace(0.8, 5.0, 9).tolist()
-    sigmas_param = cast(Any, sigmas)
-    ridge_f = frangi(inv, sigmas=sigmas_param, beta=0.5, gamma=15, black_ridges=False)
-    ridge_m = meijering(inv, sigmas=sigmas_param, alpha=None, black_ridges=False)
+    ridge_f = frangi(inv, sigmas=sigmas, beta=0.5, gamma=15, black_ridges=False)
+    ridge_m = meijering(inv, sigmas=sigmas, alpha=None, black_ridges=False)
     ridge = np.maximum(
         np.asarray(ridge_f, dtype=float, order=None),
         np.asarray(ridge_m, dtype=float, order=None)
@@ -122,9 +132,15 @@ def detect_membranes(
     return membranes, ridge, inv
 
 
-def segment_cells_from_membranes(membranes, clear_border, min_cell_area_px,
-                                 hole_fill_area_px, use_watershed=True,
-                                 ws_maxima_footprint=21):
+def segment_cells_from_membranes(
+    membranes: NDArray[np.bool_],
+    clear_border: bool,
+    min_cell_area_px: int,
+    hole_fill_area_px: int,
+    use_watershed: bool = True,
+    ws_maxima_footprint: int = 21,
+) -> NDArray[np.int_]:
+    """Segment interior regions using the membrane mask and optional watershed seeding."""
     mask = ~membranes
 
     # Fill tiny interior holes (gets rid of micro loops inside walls)
@@ -170,18 +186,27 @@ def segment_cells_from_membranes(membranes, clear_border, min_cell_area_px,
     return lbl
 
 
-def overlay_boundaries(rgb, lbl):
+def overlay_boundaries(
+    rgb: NDArray[np.uint8] | NDArray[np.float64],
+    lbl: NDArray[np.int_],
+) -> NDArray[np.uint8]:
+    """Overlay segmentation boundaries in red on top of the provided image."""
     base = rgb if rgb.ndim == 3 else color.gray2rgb(rgb)
-    base = util.img_as_float(base)
+    base_f = util.img_as_float(base)
     b = segmentation.find_boundaries(lbl, mode="outer")
-    out = base.copy()
+    out = base_f.copy()
     out[b, 0] = 1.0  # red
     out[b, 1] = 0.0
     out[b, 2] = 0.0
-    return util.img_as_ubyte(out)
+    return cast(NDArray[np.uint8], util.img_as_ubyte(out))
 
 
-def measure_cells(lbl, pixel_size_um, min_measured_area_px=0):
+def measure_cells(
+    lbl: NDArray[np.int_],
+    pixel_size_um: float,
+    min_measured_area_px: int = 0,
+) -> pd.DataFrame:
+    """Summarize geometric measurements for each labeled region."""
     props = [p for p in measure.regionprops(lbl) if p.area >= min_measured_area_px]
     px_area = np.array([p.area for p in props])
     df = pd.DataFrame({
@@ -199,12 +224,13 @@ def measure_cells(lbl, pixel_size_um, min_measured_area_px=0):
     return df
 
 
-def save_labeled_overlay(overlay_img, df, out_path, font_size=0):
-    """
-    Draw cell numbers at centroids on top of the overlay image and save.
-    overlay_img: RGB uint8 image (e.g., output of overlay_boundaries)
-    df: dataframe from measure_cells (needs 'label', 'centroid_row', 'centroid_col')
-    """
+def save_labeled_overlay(
+    overlay_img: NDArray[np.uint8],
+    df: pd.DataFrame,
+    out_path: Path | str,
+    font_size: int = 0,
+) -> None:
+    """Draw centroid labels on an overlay image and write it to disk."""
     h, w = overlay_img.shape[:2]
     if font_size <= 0:
         # auto size based on image width
@@ -227,7 +253,8 @@ def save_labeled_overlay(overlay_img, df, out_path, font_size=0):
 
 
 # Include all labels in the adjacency dict so isolated cells get unique colors
-def _label_adjacency(lbl: np.ndarray) -> dict[int, set[int]]:
+def _label_adjacency(lbl: NDArray[np.int_]) -> Dict[int, set[int]]:
+    """Return adjacency mapping between touching label IDs (excluding background)."""
     L = np.asarray(lbl, dtype=np.int32)
     if L.ndim != 2:
         L = np.squeeze(L)
@@ -259,7 +286,8 @@ def _label_adjacency(lbl: np.ndarray) -> dict[int, set[int]]:
     return nbrs
 
 
-def _greedy_coloring(nbrs: dict[int, set[int]], max_colors: int = 4) -> dict[int, int]:
+def _greedy_coloring(nbrs: Dict[int, set[int]], max_colors: int = 4) -> Dict[int, int]:
+    """Apply greedy graph coloring, returning a color index for each label."""
     # order by degree (highest first)
     order = sorted(nbrs.keys(), key=lambda k: len(nbrs[k]), reverse=True)
     color_of: dict[int, int] = {}
@@ -272,8 +300,13 @@ def _greedy_coloring(nbrs: dict[int, set[int]], max_colors: int = 4) -> dict[int
     return color_of
 
 
-def colorize_labels_overlay(lbl: np.ndarray, base_img: np.ndarray | None, alpha: float = 0.45) -> np.ndarray:
-    from skimage import color as skcolor, util as skut
+def colorize_labels_overlay(
+    lbl: NDArray[np.int_],
+    base_img: Optional[NDArray[np.uint8] | NDArray[np.float64]],
+    alpha: float = 0.45,
+) -> NDArray[np.uint8]:
+    """Return a colored overlay with distinct hues for adjacent labels."""
+    from skimage import color as skcolor
     L = np.asarray(lbl)
     if L.ndim != 2:
         L = np.squeeze(L)
@@ -317,8 +350,13 @@ def colorize_labels_overlay(lbl: np.ndarray, base_img: np.ndarray | None, alpha:
 
 
 # Simple label→color mapper (cycles a fixed palette)
-def colorize_labels_flat(lbl: np.ndarray, base_img: np.ndarray | None = None, alpha: float = 0.45) -> np.ndarray:
-    from skimage import color as skcolor, util as skut
+def colorize_labels_flat(
+    lbl: NDArray[np.int_],
+    base_img: Optional[NDArray[np.uint8] | NDArray[np.float64]] = None,
+    alpha: float = 0.45,
+) -> NDArray[np.uint8]:
+    """Assign colors by cycling a fixed palette, optionally blending with the source image."""
+    from skimage import color as skcolor
     L = np.asarray(lbl)
     if L.ndim != 2:
         L = np.squeeze(L)
@@ -439,7 +477,7 @@ def process_image(path, out_dir, pixel_size_um, clear_border, min_cell_area_px,
                   debug=False, debug_dir=None):
     gray, rgb = load_gray(path)
     membranes, ridge, inv = detect_membranes(gray)
-    mem_initial = np.asarray(membranes, dtype=bool)
+    mem_initial = cast(NDArray[np.bool_], np.asarray(membranes, dtype=bool))
 
     # proactively bridge small gaps between wall fragments
     membranes = _bridge_membrane_gaps(
@@ -451,16 +489,17 @@ def process_image(path, out_dir, pixel_size_um, clear_border, min_cell_area_px,
         dilate_radius=int(max(0, bridge_dilate_radius)),
     )
 
-    membranes = np.asarray(membranes, dtype=bool)
-    if membranes.ndim > 2:
-        membranes = np.squeeze(membranes)
-    if membranes.ndim > 2:
-        membranes = membranes.any(axis=-1)
+    membranes_arr = np.asarray(membranes, dtype=bool)
+    if membranes_arr.ndim > 2:
+        membranes_arr = np.squeeze(membranes_arr)
+    if membranes_arr.ndim > 2:
+        membranes_arr = membranes_arr.any(axis=-1)
+    membranes_bool = cast(NDArray[np.bool_], membranes_arr.astype(bool, copy=False))
     if thin_membranes:
-        membranes = morphology.thin(membranes)
+        membranes_bool = cast(NDArray[np.bool_], morphology.thin(membranes_bool))
 
     lbl = segment_cells_from_membranes(
-        membranes, clear_border, min_cell_area_px, hole_fill_area_px,
+        membranes_bool, clear_border, min_cell_area_px, hole_fill_area_px,
         use_watershed=use_watershed, ws_maxima_footprint=ws_maxima_footprint
     )
     df = measure_cells(lbl, pixel_size_um, min_measured_area_px)
