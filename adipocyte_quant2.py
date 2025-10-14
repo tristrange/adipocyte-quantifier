@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from typing import Any, cast
-from skimage import io, color, exposure, util, filters, feature, morphology, segmentation, measure
+from skimage import io, color, exposure, util, filters, feature, morphology, segmentation, measure, draw
 from skimage.morphology import disk, remove_small_holes, remove_small_objects
 from skimage.filters import frangi, meijering
 from skimage.feature import peak_local_max
@@ -220,6 +220,210 @@ def save_labeled_overlay(overlay_img, df, out_path, font_size=0):
     plt.close()
 
 
+# NEW / FIXED: include ALL labels in the adjacency dict so isolated cells get unique colors
+def _label_adjacency(lbl: np.ndarray) -> dict[int, set[int]]:
+    L = np.asarray(lbl, dtype=np.int32)
+    if L.ndim != 2:
+        L = np.squeeze(L)
+    H, W = L.shape
+    nbrs: dict[int, set[int]] = {}
+
+    def add_edge(a: int, b: int):
+        if a == 0 or b == 0 or a == b:
+            return
+        nbrs.setdefault(a, set()).add(b)
+        nbrs.setdefault(b, set()).add(a)
+
+    # 4-neighborhood edges (up/down/left/right)
+    A, B = L[1:, :], L[:-1, :]
+    mask = (A != B)
+    for a, b in zip(A[mask].ravel(), B[mask].ravel()):
+        add_edge(int(a), int(b))
+
+    A, B = L[:, 1:], L[:, :-1]
+    mask = (A != B)
+    for a, b in zip(A[mask].ravel(), B[mask].ravel()):
+        add_edge(int(a), int(b))
+
+    # Ensure every label > 0 exists as a node (isolated regions get empty neighbor sets)  # FIXED
+    labs = np.unique(L)
+    for lab in labs[labs > 0]:
+        nbrs.setdefault(int(lab), set())
+
+    return nbrs
+
+
+def _greedy_coloring(nbrs: dict[int, set[int]], max_colors: int = 4) -> dict[int, int]:
+    # order by degree (highest first)
+    order = sorted(nbrs.keys(), key=lambda k: len(nbrs[k]), reverse=True)
+    color_of: dict[int, int] = {}
+    for n in order:
+        used = {color_of[m] for m in nbrs[n] if m in color_of}
+        c = 0
+        while c in used and c < max_colors - 1:
+            c += 1
+        color_of[n] = c
+    return color_of
+
+
+def colorize_labels_overlay(lbl: np.ndarray, base_img: np.ndarray | None, alpha: float = 0.45) -> np.ndarray:
+    from skimage import color as skcolor, util as skut
+    L = np.asarray(lbl)
+    if L.ndim != 2:
+        L = np.squeeze(L)
+        if L.ndim != 2:
+            raise ValueError("label image must be 2D after squeeze")
+
+    # Build adjacency including isolated labels (fix) and color them
+    nbrs = _label_adjacency(L)                                 # FIXED
+    color_idx = _greedy_coloring(nbrs, max_colors=8)
+
+    palette = np.array([
+        [0.894, 0.102, 0.110],  # red
+        [0.216, 0.494, 0.722],  # blue
+        [0.302, 0.686, 0.290],  # green
+        [0.596, 0.306, 0.639],  # purple
+        [1.000, 0.498, 0.000],  # orange
+        [1.000, 1.000, 0.200],  # yellow
+        [0.651, 0.337, 0.157],  # brown
+        [0.969, 0.506, 0.749],  # pink
+    ])
+
+    H, W = L.shape
+    color_img = np.zeros((H, W, 3), dtype=float)
+    for lab, cidx in color_idx.items():
+        mask = (L == lab)
+        color_img[mask] = palette[cidx % len(palette)]
+
+    # Blend onto base image (or return solid colored map if base is None)
+    if base_img is None:
+        return (np.clip(color_img, 0, 1) * 255).astype(np.uint8)
+
+    base = np.asarray(base_img, dtype=float)
+    if base.ndim == 2:
+        base = skcolor.gray2rgb(base)
+    if base.shape[-1] != 3:
+        base = base[..., :3]
+    base = base / 255.0 if base.max() > 1.0 else base
+    a = float(np.clip(alpha, 0.0, 1.0))
+    out = np.clip(a * color_img + (1 - a) * base, 0, 1)
+    return (out * 255).astype(np.uint8)
+
+
+# NEW: simple label→color mapper (cycles a fixed palette)
+def colorize_labels_flat(lbl: np.ndarray, base_img: np.ndarray | None = None, alpha: float = 0.45) -> np.ndarray:
+    from skimage import color as skcolor, util as skut
+    L = np.asarray(lbl)
+    if L.ndim != 2:
+        L = np.squeeze(L)
+        if L.ndim != 2:
+            raise ValueError("label image must be 2D after squeeze")
+
+    # fixed palette (8 distinct colors); labels cycle 0..7  # NEW
+    palette = np.array([
+        [0.894, 0.102, 0.110],  # red
+        [0.216, 0.494, 0.722],  # blue
+        [0.302, 0.686, 0.290],  # green
+        [0.596, 0.306, 0.639],  # purple
+        [1.000, 0.498, 0.000],  # orange
+        [1.000, 1.000, 0.200],  # yellow
+        [0.651, 0.337, 0.157],  # brown
+        [0.969, 0.506, 0.749],  # pink
+    ], dtype=float)
+
+    H, W = L.shape
+    color_img = np.zeros((H, W, 3), dtype=float)
+
+    # assign color by (label % len(palette)); skip background 0  # NEW
+    labs = np.unique(L)
+    labs = labs[labs > 0]
+    for lab in labs:
+        color_img[L == lab] = palette[int(lab) % len(palette)]
+
+    if base_img is None:
+        return (np.clip(color_img, 0, 1) * 255).astype(np.uint8)
+
+    base = np.asarray(base_img, dtype=float)
+    if base.ndim == 2:
+        base = skcolor.gray2rgb(base)
+    if base.shape[-1] != 3:
+        base = base[..., :3]
+    base = base / 255.0 if base.max() > 1.0 else base
+
+    a = float(np.clip(alpha, 0.0, 1.0))
+    out = np.clip(a * color_img + (1 - a) * base, 0, 1)
+    return (out * 255).astype(np.uint8)
+
+
+# NEW
+def _bridge_membrane_gaps(
+    membranes: np.ndarray,
+    ridge: np.ndarray,
+    max_dist: int = 12,
+    min_ridge: float = 0.18,
+    iterations: int = 1,
+    dilate_radius: int = 1,
+) -> np.ndarray:
+    """
+    Connect close skeleton endpoints if the straight-line path has sufficient ridge support.
+    membranes: bool HxW
+    ridge: float HxW in [0,1] (from detect_membranes)
+    """
+    m = membranes.astype(bool)
+    ridge = np.asarray(ridge, dtype=float)
+    iterations = max(1, int(iterations))
+    dilate_radius = max(0, int(dilate_radius))
+    dilate_fp = disk(dilate_radius) if dilate_radius > 0 else None
+
+    kernel = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.uint8)
+    max_d2 = max_dist * max_dist
+    min_ridge = float(min_ridge)
+
+    for _ in range(iterations):
+        sk = morphology.skeletonize(m)
+
+        # count 8-neighborhood degree; endpoints have exactly 1 neighbor
+        deg = ndi.convolve(sk.astype(np.uint8), kernel, mode="constant")
+        ends = np.column_stack(np.nonzero(sk & (deg == 1)))
+        if ends.size == 0:
+            break
+
+        H, W = m.shape
+        added = np.zeros_like(m, dtype=bool)
+
+        # simple O(N^2) search within radius (images are modest)
+        for i in range(len(ends)):
+            r1, c1 = ends[i]
+            for j in range(i + 1, len(ends)):
+                r2, c2 = ends[j]
+                dr, dc = r2 - r1, c2 - c1
+                if dr * dr + dc * dc > max_d2:
+                    continue
+
+                rr, cc = draw.line(int(r1), int(c1), int(r2), int(c2))
+                # keep line in bounds
+                ok = (rr >= 0) & (rr < H) & (cc >= 0) & (cc < W)
+                rr, cc = rr[ok], cc[ok]
+                if rr.size == 0:
+                    continue
+
+                mean_ridge = float(np.nanmean(ridge[rr, cc]))
+                if min_ridge <= 0 or mean_ridge >= min_ridge:
+                    added[rr, cc] = True
+
+        if not added.any():
+            break
+
+        if dilate_fp is not None:
+            added = morphology.binary_dilation(added, footprint=dilate_fp)
+        m |= added
+
+    return m
+
+
+    return m
+
+
 # ----------------------------
 # Batch runner
 # ----------------------------
@@ -227,9 +431,25 @@ def save_labeled_overlay(overlay_img, df, out_path, font_size=0):
 def process_image(path, out_dir, pixel_size_um, clear_border, min_cell_area_px,
                   hole_fill_area_px, min_measured_area_px, save_overlay=True,
                   overlay_labels=False, label_font_size=0,
-                  thin_membranes=False, use_watershed=True, ws_maxima_footprint=21):
+                  thin_membranes=False, use_watershed=True, ws_maxima_footprint=21,
+                  overlay_colored=False, color_alpha=0.45,
+                  bridge_gaps_px=12, bridge_min_ridge=0.18,
+                  bridge_iters=1, bridge_dilate_radius=1,
+                  debug=False, debug_dir=None):  # NEW
     gray, rgb = load_gray(path)
-    membranes, _ridge, _inv = detect_membranes(gray)
+    membranes, ridge, inv = detect_membranes(gray)
+    mem_initial = np.asarray(membranes, dtype=bool)
+
+    # proactively bridge small gaps between wall fragments
+    membranes = _bridge_membrane_gaps(
+        mem_initial,
+        np.asarray(ridge, dtype=float),
+        max_dist=int(bridge_gaps_px),          # NEW
+        min_ridge=float(bridge_min_ridge),     # NEW
+        iterations=int(max(1, bridge_iters)),
+        dilate_radius=int(max(0, bridge_dilate_radius)),
+    )
+
     membranes = np.asarray(membranes, dtype=bool)
     if membranes.ndim > 2:
         membranes = np.squeeze(membranes)
@@ -247,6 +467,27 @@ def process_image(path, out_dir, pixel_size_um, clear_border, min_cell_area_px,
     stem = Path(path).stem
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    if debug:
+        dbg_dir = debug_dir or (out_dir / "debug")
+        dbg_dir.mkdir(parents=True, exist_ok=True)
+
+        def _save_debug(name: str, arr: Any) -> None:
+            path = dbg_dir / f"{stem}_{name}.png"
+            if arr.dtype == bool:
+                img = (arr.astype(np.uint8) * 255)
+            else:
+                data = np.asarray(arr, dtype=float)
+                data = np.nan_to_num(data, nan=0.0)
+                data = np.clip(data, 0.0, 1.0)
+                img = util.img_as_ubyte(data)
+            io.imsave(path, img)
+
+        _save_debug("gray_eq", gray)
+        _save_debug("inv", inv)
+        _save_debug("ridge", ridge)
+        _save_debug("membranes_prebridge", mem_initial)
+        _save_debug("membranes_postbridge", membranes)
+
     df.to_csv(out_dir / f"{stem}_measurements.csv", index=False)
     if save_overlay:
         ov = overlay_boundaries(rgb, lbl)
@@ -255,6 +496,11 @@ def process_image(path, out_dir, pixel_size_um, clear_border, min_cell_area_px,
         if overlay_labels:
             labeled_path = out_dir / f"{stem}_overlay_labeled.png"
             save_labeled_overlay(ov, df, labeled_path, font_size=label_font_size)
+        if overlay_colored:  # NEW
+            # color fill where adjacent cells get different colors, blended over the base image  # NEW
+            # colored = colorize_labels_overlay(lbl, rgb, alpha=color_alpha)  # NEW
+            colored = colorize_labels_flat(lbl, rgb, alpha=color_alpha)
+            io.imsave(out_dir / f"{stem}_overlay_colored.png", colored)     # NEW
 
     return df, lbl
 
@@ -283,6 +529,12 @@ def main():
                     help="Also save an overlay PNG with cell numbers at centroids")
     ap.add_argument("--label-font-size", type=int, default=0,
                     help="Font size for overlay labels (0 = auto)")
+    
+    ap.add_argument("--overlay-colored", action="store_true",
+                    help="Also save a colored overlay where adjacent cells have different colors  # NEW")
+    ap.add_argument("--color-alpha", type=float, default=0.45,
+                    help="Alpha for colored overlay blending into the image (0–1)  # NEW")
+
 
     # membrane detection tuning
     ap.add_argument("--no-top-hat", action="store_true",
@@ -305,6 +557,16 @@ def main():
                     help="binary_closing disk size for membranes (2–4 typical)")
     ap.add_argument("--mem-dilate", type=int, default=2,
                     help="binary_dilation disk size for membranes (1–3 typical)")
+    # bridge gap
+    ap.add_argument("--bridge-gaps-px", type=int, default=12,
+                    help="Max pixel distance to bridge between membrane endpoints  # NEW")
+    ap.add_argument("--bridge-min-ridge", type=float, default=0.18,
+                    help="Min mean ridge value along the bridge to accept [0..1]  # NEW")
+    ap.add_argument("--bridge-iters", type=int, default=1,
+                    help="How many bridging passes to run (higher = more aggressive)")
+    ap.add_argument("--bridge-dilate-radius", type=int, default=1,
+                    help="Radius (in px) to dilate accepted bridges for robustness")
+
 
     # watershed & thinning
     ap.add_argument("--thin-membranes", action="store_true",
@@ -340,7 +602,15 @@ def main():
             label_font_size=args.label_font_size,
             thin_membranes=args.thin_membranes,
             use_watershed=args.use_watershed,
-            ws_maxima_footprint=args.ws_maxima_footprint
+            ws_maxima_footprint=args.ws_maxima_footprint,
+            overlay_colored=getattr(args, "overlay_colored", False),
+            color_alpha=getattr(args, "color_alpha", 0.45),
+            bridge_gaps_px=getattr(args, "bridge_gaps_px", 12),
+            bridge_min_ridge=getattr(args, "bridge_min_ridge", 0.18),
+            bridge_iters=getattr(args, "bridge_iters", 1),
+            bridge_dilate_radius=getattr(args, "bridge_dilate_radius", 1),
+            debug=getattr(args, "debug", False),
+            debug_dir=out_dir / "debug" if getattr(args, "debug", False) else None,
         )
         df["image"] = p.name
         all_rows.append(df)
