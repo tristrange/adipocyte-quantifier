@@ -88,4 +88,4 @@ With `--debug`, additional PNGs (equalised grayscale, inverted image, ridge resp
 
 ## License
 
-Add your preferred license here (e.g. MIT) before publishing.
+Released under the [MIT License](LICENSE).
