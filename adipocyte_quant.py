@@ -6,13 +6,19 @@ Install:
   pip install numpy pandas scikit-image matplotlib
 
 Usage:
-    python adipocyte_quant2.py \
+    python adipocyte_quant.py \
         --input /path/to/folder \
         --output /path/to/out \
         --pixel-size-um 0.33 \
-        --clear-border \
-        --min-cell-area-px 600 --hole-fill-area-px 2500 \
+        --min-cell-area-px 800 --hole-fill-area-px 2500 \
         --min-measured-area-px 1500 \
+        --ridge-hi 0.95 --ridge-lo-mul 0.60 \
+        --canny-sigma 1.6 --canny-low 0.05 --canny-high 0.15 \
+        --mem-close 4 --mem-dilate 2 \
+        --use-watershed --ws-maxima-footprint 10 \
+        --bridge-gaps-px 55 --bridge-min-ridge 0.0 \
+        --bridge-iters 5 --bridge-dilate-radius 3 \
+        --overlay-colored --color-alpha 0.45 \
         --overlay-labels --label-font-size 0
 """
 
@@ -220,7 +226,7 @@ def save_labeled_overlay(overlay_img, df, out_path, font_size=0):
     plt.close()
 
 
-# NEW / FIXED: include ALL labels in the adjacency dict so isolated cells get unique colors
+# Include all labels in the adjacency dict so isolated cells get unique colors
 def _label_adjacency(lbl: np.ndarray) -> dict[int, set[int]]:
     L = np.asarray(lbl, dtype=np.int32)
     if L.ndim != 2:
@@ -245,7 +251,7 @@ def _label_adjacency(lbl: np.ndarray) -> dict[int, set[int]]:
     for a, b in zip(A[mask].ravel(), B[mask].ravel()):
         add_edge(int(a), int(b))
 
-    # Ensure every label > 0 exists as a node (isolated regions get empty neighbor sets)  # FIXED
+    # Ensure every label > 0 exists as a node (isolated regions get empty neighbor sets)
     labs = np.unique(L)
     for lab in labs[labs > 0]:
         nbrs.setdefault(int(lab), set())
@@ -274,8 +280,8 @@ def colorize_labels_overlay(lbl: np.ndarray, base_img: np.ndarray | None, alpha:
         if L.ndim != 2:
             raise ValueError("label image must be 2D after squeeze")
 
-    # Build adjacency including isolated labels (fix) and color them
-    nbrs = _label_adjacency(L)                                 # FIXED
+    # Build adjacency including isolated labels and color them
+    nbrs = _label_adjacency(L)
     color_idx = _greedy_coloring(nbrs, max_colors=8)
 
     palette = np.array([
@@ -310,7 +316,7 @@ def colorize_labels_overlay(lbl: np.ndarray, base_img: np.ndarray | None, alpha:
     return (out * 255).astype(np.uint8)
 
 
-# NEW: simple label→color mapper (cycles a fixed palette)
+# Simple label→color mapper (cycles a fixed palette)
 def colorize_labels_flat(lbl: np.ndarray, base_img: np.ndarray | None = None, alpha: float = 0.45) -> np.ndarray:
     from skimage import color as skcolor, util as skut
     L = np.asarray(lbl)
@@ -319,7 +325,7 @@ def colorize_labels_flat(lbl: np.ndarray, base_img: np.ndarray | None = None, al
         if L.ndim != 2:
             raise ValueError("label image must be 2D after squeeze")
 
-    # fixed palette (8 distinct colors); labels cycle 0..7  # NEW
+    # fixed palette (8 distinct colors); labels cycle 0..7
     palette = np.array([
         [0.894, 0.102, 0.110],  # red
         [0.216, 0.494, 0.722],  # blue
@@ -334,7 +340,7 @@ def colorize_labels_flat(lbl: np.ndarray, base_img: np.ndarray | None = None, al
     H, W = L.shape
     color_img = np.zeros((H, W, 3), dtype=float)
 
-    # assign color by (label % len(palette)); skip background 0  # NEW
+    # assign color by (label % len(palette)); skip background 0
     labs = np.unique(L)
     labs = labs[labs > 0]
     for lab in labs:
@@ -354,8 +360,6 @@ def colorize_labels_flat(lbl: np.ndarray, base_img: np.ndarray | None = None, al
     out = np.clip(a * color_img + (1 - a) * base, 0, 1)
     return (out * 255).astype(np.uint8)
 
-
-# NEW
 def _bridge_membrane_gaps(
     membranes: np.ndarray,
     ridge: np.ndarray,
@@ -421,21 +425,18 @@ def _bridge_membrane_gaps(
     return m
 
 
-    return m
-
-
 # ----------------------------
 # Batch runner
 # ----------------------------
 
 def process_image(path, out_dir, pixel_size_um, clear_border, min_cell_area_px,
                   hole_fill_area_px, min_measured_area_px, save_overlay=True,
-                  overlay_labels=False, label_font_size=0,
-                  thin_membranes=False, use_watershed=True, ws_maxima_footprint=21,
-                  overlay_colored=False, color_alpha=0.45,
-                  bridge_gaps_px=12, bridge_min_ridge=0.18,
-                  bridge_iters=1, bridge_dilate_radius=1,
-                  debug=False, debug_dir=None):  # NEW
+                  overlay_labels=True, label_font_size=0,
+                  thin_membranes=False, use_watershed=True, ws_maxima_footprint=10,
+                  overlay_colored=True, color_alpha=0.45,
+                  bridge_gaps_px=55, bridge_min_ridge=0.0,
+                  bridge_iters=5, bridge_dilate_radius=3,
+                  debug=False, debug_dir=None):
     gray, rgb = load_gray(path)
     membranes, ridge, inv = detect_membranes(gray)
     mem_initial = np.asarray(membranes, dtype=bool)
@@ -444,8 +445,8 @@ def process_image(path, out_dir, pixel_size_um, clear_border, min_cell_area_px,
     membranes = _bridge_membrane_gaps(
         mem_initial,
         np.asarray(ridge, dtype=float),
-        max_dist=int(bridge_gaps_px),          # NEW
-        min_ridge=float(bridge_min_ridge),     # NEW
+        max_dist=int(bridge_gaps_px),
+        min_ridge=float(bridge_min_ridge),
         iterations=int(max(1, bridge_iters)),
         dilate_radius=int(max(0, bridge_dilate_radius)),
     )
@@ -473,8 +474,9 @@ def process_image(path, out_dir, pixel_size_um, clear_border, min_cell_area_px,
 
         def _save_debug(name: str, arr: Any) -> None:
             path = dbg_dir / f"{stem}_{name}.png"
-            if arr.dtype == bool:
-                img = (arr.astype(np.uint8) * 255)
+            data = np.asarray(arr)
+            if data.dtype == bool:
+                img = (data.astype(np.uint8) * 255)
             else:
                 data = np.asarray(arr, dtype=float)
                 data = np.nan_to_num(data, nan=0.0)
@@ -496,11 +498,10 @@ def process_image(path, out_dir, pixel_size_um, clear_border, min_cell_area_px,
         if overlay_labels:
             labeled_path = out_dir / f"{stem}_overlay_labeled.png"
             save_labeled_overlay(ov, df, labeled_path, font_size=label_font_size)
-        if overlay_colored:  # NEW
-            # color fill where adjacent cells get different colors, blended over the base image  # NEW
-            # colored = colorize_labels_overlay(lbl, rgb, alpha=color_alpha)  # NEW
+        if overlay_colored:
+            # color fill where adjacent cells get different colors, blended over the base image
             colored = colorize_labels_flat(lbl, rgb, alpha=color_alpha)
-            io.imsave(out_dir / f"{stem}_overlay_colored.png", colored)     # NEW
+            io.imsave(out_dir / f"{stem}_overlay_colored.png", colored)
 
     return df, lbl
 
@@ -509,9 +510,9 @@ def main():
     ap = argparse.ArgumentParser(description="Adipocyte quantification")
     ap.add_argument("--input", required=True, help="Folder with images (jpg/png/tif)")
     ap.add_argument("--output", required=True, help="Output folder")
-    ap.add_argument("--pixel-size-um", type=float, default=1.0,
+    ap.add_argument("--pixel-size-um", type=float, default=0.33,
                     help="Micrometers per pixel for area/length units")
-    ap.add_argument("--min-cell-area-px", type=int, default=400,
+    ap.add_argument("--min-cell-area-px", type=int, default=800,
                     help="Discard components smaller than this (pixels)")
     ap.add_argument("--clear-border", action="store_true",
                     help="Exclude cells touching image border")
@@ -519,21 +520,25 @@ def main():
                     help="Skip saving overlay PNGs")
 
     # segmentation post/measure controls
-    ap.add_argument("--hole-fill-area-px", type=int, default=400,
+    ap.add_argument("--hole-fill-area-px", type=int, default=2500,
                     help="Fill interior holes up to this area before labeling")
-    ap.add_argument("--min-measured-area-px", type=int, default=0,
+    ap.add_argument("--min-measured-area-px", type=int, default=1500,
                     help="Exclude labeled regions smaller than this area in outputs")
 
     # overlay labeling
-    ap.add_argument("--overlay-labels", action="store_true",
+    ap.add_argument("--overlay-labels", dest="overlay_labels", action="store_true", default=True,
                     help="Also save an overlay PNG with cell numbers at centroids")
+    ap.add_argument("--no-overlay-labels", dest="overlay_labels", action="store_false",
+                    help="Disable centroid labels on overlays")
     ap.add_argument("--label-font-size", type=int, default=0,
                     help="Font size for overlay labels (0 = auto)")
     
-    ap.add_argument("--overlay-colored", action="store_true",
-                    help="Also save a colored overlay where adjacent cells have different colors  # NEW")
+    ap.add_argument("--overlay-colored", dest="overlay_colored", action="store_true", default=True,
+                    help="Also save a colored overlay where adjacent cells have different colors")
+    ap.add_argument("--no-overlay-colored", dest="overlay_colored", action="store_false",
+                    help="Disable the colored overlay output")
     ap.add_argument("--color-alpha", type=float, default=0.45,
-                    help="Alpha for colored overlay blending into the image (0–1)  # NEW")
+                    help="Alpha for colored overlay blending into the image (0–1)")
 
 
     # membrane detection tuning
@@ -543,37 +548,39 @@ def main():
                     help="Radius for black top-hat (2–6 typical)")
     ap.add_argument("--tophat-gain", type=float, default=0.6,
                     help="Blend of top-hat into inverted image (0–1)")
-    ap.add_argument("--ridge-hi", type=float, default=0.85,
+    ap.add_argument("--ridge-hi", type=float, default=0.95,
                     help="Hysteresis HIGH threshold multiplier on ridge (lower → more aggressive)")
-    ap.add_argument("--ridge-lo-mul", type=float, default=0.45,
+    ap.add_argument("--ridge-lo-mul", type=float, default=0.60,
                     help="LOW = ridge_hi * ridge_lo_mul (higher → less aggressive)")
     ap.add_argument("--canny-sigma", type=float, default=1.6,
                     help="Canny Gaussian sigma")
-    ap.add_argument("--canny-low", type=float, default=0.03,
+    ap.add_argument("--canny-low", type=float, default=0.05,
                     help="Canny low threshold (0–1)")
-    ap.add_argument("--canny-high", type=float, default=0.12,
+    ap.add_argument("--canny-high", type=float, default=0.15,
                     help="Canny high threshold (0–1)")
-    ap.add_argument("--mem-close", type=int, default=3,
+    ap.add_argument("--mem-close", type=int, default=4,
                     help="binary_closing disk size for membranes (2–4 typical)")
     ap.add_argument("--mem-dilate", type=int, default=2,
                     help="binary_dilation disk size for membranes (1–3 typical)")
     # bridge gap
-    ap.add_argument("--bridge-gaps-px", type=int, default=12,
-                    help="Max pixel distance to bridge between membrane endpoints  # NEW")
-    ap.add_argument("--bridge-min-ridge", type=float, default=0.18,
-                    help="Min mean ridge value along the bridge to accept [0..1]  # NEW")
-    ap.add_argument("--bridge-iters", type=int, default=1,
+    ap.add_argument("--bridge-gaps-px", type=int, default=55,
+                    help="Max pixel distance to bridge between membrane endpoints")
+    ap.add_argument("--bridge-min-ridge", type=float, default=0.0,
+                    help="Min mean ridge value along the bridge to accept [0..1]")
+    ap.add_argument("--bridge-iters", type=int, default=5,
                     help="How many bridging passes to run (higher = more aggressive)")
-    ap.add_argument("--bridge-dilate-radius", type=int, default=1,
+    ap.add_argument("--bridge-dilate-radius", type=int, default=3,
                     help="Radius (in px) to dilate accepted bridges for robustness")
 
 
     # watershed & thinning
     ap.add_argument("--thin-membranes", action="store_true",
                     help="Skeletonize membranes to 1 px before segmentation")
-    ap.add_argument("--use-watershed", action="store_true",
+    ap.add_argument("--use-watershed", dest="use_watershed", action="store_true", default=True,
                     help="Use distance-transform watershed for interiors")
-    ap.add_argument("--ws-maxima-footprint", type=int, default=21,
+    ap.add_argument("--no-watershed", dest="use_watershed", action="store_false",
+                    help="Disable watershed and fall back to connected components")
+    ap.add_argument("--ws-maxima-footprint", type=int, default=10,
                     help="Footprint (px) / min spacing for watershed seeds")
 
     # debug
@@ -603,14 +610,14 @@ def main():
             thin_membranes=args.thin_membranes,
             use_watershed=args.use_watershed,
             ws_maxima_footprint=args.ws_maxima_footprint,
-            overlay_colored=getattr(args, "overlay_colored", False),
-            color_alpha=getattr(args, "color_alpha", 0.45),
-            bridge_gaps_px=getattr(args, "bridge_gaps_px", 12),
-            bridge_min_ridge=getattr(args, "bridge_min_ridge", 0.18),
-            bridge_iters=getattr(args, "bridge_iters", 1),
-            bridge_dilate_radius=getattr(args, "bridge_dilate_radius", 1),
-            debug=getattr(args, "debug", False),
-            debug_dir=out_dir / "debug" if getattr(args, "debug", False) else None,
+            overlay_colored=args.overlay_colored,
+            color_alpha=args.color_alpha,
+            bridge_gaps_px=args.bridge_gaps_px,
+            bridge_min_ridge=args.bridge_min_ridge,
+            bridge_iters=args.bridge_iters,
+            bridge_dilate_radius=args.bridge_dilate_radius,
+            debug=args.debug,
+            debug_dir=out_dir / "debug" if args.debug else None,
         )
         df["image"] = p.name
         all_rows.append(df)
