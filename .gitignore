@@ -1,0 +1,7 @@
+# Ignore Python virtual environment folder
+.venv/
+.DS_Store
+test/
+M01/
+out/
+__pycache__/
