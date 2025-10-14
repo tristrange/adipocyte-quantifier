@@ -37,6 +37,52 @@ from skimage.feature import peak_local_max
 from skimage.filters import frangi, meijering
 from skimage.morphology import disk, remove_small_holes, remove_small_objects
 
+# ----------------------------
+# Constants
+# ----------------------------
+
+# Default sigma scales for ridge filters
+RIDGE_SIGMAS: list[float] = np.linspace(0.8, 5.0, 9).tolist()
+
+# Minimum speckle size removed from membrane mask
+MIN_MEMBRANE_OBJECT_SIZE: int = 24
+
+# Distinct color palette (RGB in 0..1)
+PALETTE_8: NDArray[np.float64] = np.array([
+    [0.894, 0.102, 0.110],  # red
+    [0.216, 0.494, 0.722],  # blue
+    [0.302, 0.686, 0.290],  # green
+    [0.596, 0.306, 0.639],  # purple
+    [1.000, 0.498, 0.000],  # orange
+    [1.000, 1.000, 0.200],  # yellow
+    [0.651, 0.337, 0.157],  # brown
+    [0.969, 0.506, 0.749],  # pink
+], dtype=float)
+
+
+# ----------------------------
+# Small helpers
+# ----------------------------
+
+def as_bool_mask(arr: Any) -> NDArray[np.bool_]:
+    """Return a 2D boolean mask from an array-like, squeezing and reducing channels if needed."""
+    m = np.asarray(arr, dtype=bool)
+    if m.ndim > 2:
+        m = np.squeeze(m)
+    if m.ndim > 2:
+        m = m.any(axis=-1)
+    return cast(NDArray[np.bool_], m)
+
+
+def ensure_labels_2d(lbl: Any) -> NDArray[np.int_]:
+    """Ensure labels are a 2D integer array, squeezing singleton axes if present."""
+    L = np.asarray(lbl, dtype=np.int32)
+    if L.ndim != 2:
+        L = np.squeeze(L)
+        if L.ndim != 2:
+            raise ValueError("label image must be 2D after squeeze")
+    return cast(NDArray[np.int_], L)
+
 
 # ----------------------------
 # Core functions
@@ -98,9 +144,8 @@ def detect_membranes(
         inv = np.clip(inv + float(tophat_gain) * bth, 0, 1)
 
     # ridge enhancement (bright ridges on the inverted image)
-    sigmas = np.linspace(0.8, 5.0, 9).tolist()
-    ridge_f = frangi(inv, sigmas=sigmas, beta=0.5, gamma=15, black_ridges=False)
-    ridge_m = meijering(inv, sigmas=sigmas, alpha=None, black_ridges=False)
+    ridge_f = frangi(inv, sigmas=cast(Any, RIDGE_SIGMAS), beta=0.5, gamma=15, black_ridges=False)
+    ridge_m = meijering(inv, sigmas=cast(Any, RIDGE_SIGMAS), alpha=None, black_ridges=False)
     ridge = np.maximum(
         np.asarray(ridge_f, dtype=float, order=None),
         np.asarray(ridge_m, dtype=float, order=None)
@@ -126,7 +171,7 @@ def detect_membranes(
     membranes = mem_ridge | edges
     membranes = morphology.binary_opening(membranes, footprint=disk(1))
     membranes = morphology.binary_closing(membranes, footprint=disk(int(max(1, mem_close))))
-    membranes = remove_small_objects(membranes, min_size=24)
+    membranes = remove_small_objects(membranes, min_size=MIN_MEMBRANE_OBJECT_SIZE)
     membranes = morphology.binary_dilation(membranes, footprint=disk(int(max(1, mem_dilate))))
 
     return membranes, ridge, inv
@@ -255,9 +300,7 @@ def save_labeled_overlay(
 # Include all labels in the adjacency dict so isolated cells get unique colors
 def _label_adjacency(lbl: NDArray[np.int_]) -> Dict[int, set[int]]:
     """Return adjacency mapping between touching label IDs (excluding background)."""
-    L = np.asarray(lbl, dtype=np.int32)
-    if L.ndim != 2:
-        L = np.squeeze(L)
+    L = ensure_labels_2d(lbl)
     H, W = L.shape
     nbrs: dict[int, set[int]] = {}
 
@@ -307,26 +350,13 @@ def colorize_labels_overlay(
 ) -> NDArray[np.uint8]:
     """Return a colored overlay with distinct hues for adjacent labels."""
     from skimage import color as skcolor
-    L = np.asarray(lbl)
-    if L.ndim != 2:
-        L = np.squeeze(L)
-        if L.ndim != 2:
-            raise ValueError("label image must be 2D after squeeze")
+    L = ensure_labels_2d(lbl)
 
     # Build adjacency including isolated labels and color them
     nbrs = _label_adjacency(L)
     color_idx = _greedy_coloring(nbrs, max_colors=8)
 
-    palette = np.array([
-        [0.894, 0.102, 0.110],  # red
-        [0.216, 0.494, 0.722],  # blue
-        [0.302, 0.686, 0.290],  # green
-        [0.596, 0.306, 0.639],  # purple
-        [1.000, 0.498, 0.000],  # orange
-        [1.000, 1.000, 0.200],  # yellow
-        [0.651, 0.337, 0.157],  # brown
-        [0.969, 0.506, 0.749],  # pink
-    ])
+    palette = PALETTE_8
 
     H, W = L.shape
     color_img = np.zeros((H, W, 3), dtype=float)
@@ -357,23 +387,10 @@ def colorize_labels_flat(
 ) -> NDArray[np.uint8]:
     """Assign colors by cycling a fixed palette, optionally blending with the source image."""
     from skimage import color as skcolor
-    L = np.asarray(lbl)
-    if L.ndim != 2:
-        L = np.squeeze(L)
-        if L.ndim != 2:
-            raise ValueError("label image must be 2D after squeeze")
+    L = ensure_labels_2d(lbl)
 
     # fixed palette (8 distinct colors); labels cycle 0..7
-    palette = np.array([
-        [0.894, 0.102, 0.110],  # red
-        [0.216, 0.494, 0.722],  # blue
-        [0.302, 0.686, 0.290],  # green
-        [0.596, 0.306, 0.639],  # purple
-        [1.000, 0.498, 0.000],  # orange
-        [1.000, 1.000, 0.200],  # yellow
-        [0.651, 0.337, 0.157],  # brown
-        [0.969, 0.506, 0.749],  # pink
-    ], dtype=float)
+    palette = PALETTE_8
 
     H, W = L.shape
     color_img = np.zeros((H, W, 3), dtype=float)
@@ -467,14 +484,30 @@ def _bridge_membrane_gaps(
 # Batch runner
 # ----------------------------
 
-def process_image(path, out_dir, pixel_size_um, clear_border, min_cell_area_px,
-                  hole_fill_area_px, min_measured_area_px, save_overlay=True,
-                  overlay_labels=True, label_font_size=0,
-                  thin_membranes=False, use_watershed=True, ws_maxima_footprint=10,
-                  overlay_colored=True, color_alpha=0.45,
-                  bridge_gaps_px=55, bridge_min_ridge=0.0,
-                  bridge_iters=5, bridge_dilate_radius=3,
-                  debug=False, debug_dir=None):
+def process_image(
+    path: str | Path,
+    out_dir: Path,
+    pixel_size_um: float,
+    clear_border: bool,
+    min_cell_area_px: int,
+    hole_fill_area_px: int,
+    min_measured_area_px: int,
+    save_overlay: bool = True,
+    overlay_labels: bool = True,
+    label_font_size: int = 0,
+    thin_membranes: bool = False,
+    use_watershed: bool = True,
+    ws_maxima_footprint: int = 10,
+    overlay_colored: bool = True,
+    color_alpha: float = 0.45,
+    bridge_gaps_px: int = 55,
+    bridge_min_ridge: float = 0.0,
+    bridge_iters: int = 5,
+    bridge_dilate_radius: int = 3,
+    debug: bool = False,
+    debug_dir: Optional[Path] = None,
+) -> tuple[pd.DataFrame, NDArray[np.int_]]:
+    """Process a single image: segmentation, measurement, overlays, optional debug outputs."""
     gray, rgb = load_gray(path)
     membranes, ridge, inv = detect_membranes(gray)
     mem_initial = cast(NDArray[np.bool_], np.asarray(membranes, dtype=bool))
@@ -489,12 +522,7 @@ def process_image(path, out_dir, pixel_size_um, clear_border, min_cell_area_px,
         dilate_radius=int(max(0, bridge_dilate_radius)),
     )
 
-    membranes_arr = np.asarray(membranes, dtype=bool)
-    if membranes_arr.ndim > 2:
-        membranes_arr = np.squeeze(membranes_arr)
-    if membranes_arr.ndim > 2:
-        membranes_arr = membranes_arr.any(axis=-1)
-    membranes_bool = cast(NDArray[np.bool_], membranes_arr.astype(bool, copy=False))
+    membranes_bool = as_bool_mask(membranes)
     if thin_membranes:
         membranes_bool = cast(NDArray[np.bool_], morphology.thin(membranes_bool))
 
