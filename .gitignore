@@ -7,3 +7,4 @@ out/
 __pycache__/
 adipocyte_gui.py
 M01_results/
+adipocyte_gui_tk.py
